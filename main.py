@@ -92,6 +92,9 @@ def main():
     else:
         wall = list(filter(lambda post: post['id'] > last_post_id, wall))
 
+    if len(wall) == 0:
+        return
+
     i = 2000000000
     while True:
         i += 1
@@ -102,8 +105,8 @@ def main():
             continue
         if status == ChatStatus.not_found:
             break
-    if len(wall) > 0:
-        set_last_post_id(wall[-1]['id'])
+
+    set_last_post_id(wall[-1]['id'])
 
 
 if __name__ == "__main__":
