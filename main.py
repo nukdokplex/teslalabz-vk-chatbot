@@ -1,114 +1,127 @@
-import enum
-import json
-import os
-import time
-from pathlib import Path
-
+import argparse
 import vk_api
-from dotenv import load_dotenv
-from vk_api.utils import get_random_id
-from vk_api.vk_api import VkApiMethod
+import random
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.execute import VkApiMethod
+import sqlite3
+
+SUBSCRIBE_COMMAND = "!subscribe"
+UNSUBSCRIBE_COMMAND = "!unsubscribe"
 
 
-class ChatStatus(enum.Enum):
-    available = 1
-    cant_write = 2
-    not_found = 3
+def send_message(
+    vk: VkApiMethod, chat_id: int, message: str, attachments: list[str] = None
+):
+    args = {
+        "chat_id": chat_id,
+        "message": message,
+        "random_id": random.randint(-2_147_483_648, 2_147_483_647),
+    }
+    if attachments is not None:
+        args["attachment"] = ",".join(attachments)
+    vk.messages.send(**args)
 
 
-def get_filename():
-    return Path.cwd() / "last_post_id.json"
+def main(args: argparse.Namespace):
+    """The main method which runs cycle"""
+    print("Creating session...")
 
+    session = vk_api.VkApi(token=args.token)
+    longpoll = VkBotLongPoll(session, abs(int(args.group_id)))
+    vk = session.get_api()
 
-def get_last_post_id() -> int | None:
-    filename = get_filename()
-    if Path.exists(filename):
-        with open(filename, 'r') as fp:
-            data = json.load(fp)
-            return data['last_post_id']
-    return None
+    print("Connecting database...")
+    con = sqlite3.connect(args.database)
+    with con:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS subscriptions("
+            "id INTEGER PRIMARY KEY, "
+            "group_id UNSIGNED BIG INT NOT NULL, "
+            "chat_id UNSIGNED BIG INT NOT NULL, "
+            "msg_text TEXT, "
+            "UNIQUE(group_id, chat_id) ON CONFLICT REPLACE);"
+        )
 
+    print("Bot started! Listening to longpoll events...")
 
-def set_last_post_id(post_id: int) -> None:
-    filename = get_filename()
-    data = {'last_post_id': post_id}
-    with open(filename, 'w') as fp:
-        json.dump(data, fp)
+    for event in longpoll.listen():
+        if event.type == VkBotEventType.WALL_POST_NEW:
+            print("New post event! Sending to subscribed chats...")
+            with con:
+                sql = "SELECT * FROM subscriptions WHERE group_id = ?;"
+                for subscription in con.execute(sql, (int(args.group_id),)):
+                    send_message(
+                        vk,
+                        subscription[2],
+                        subscription[3] or "",
+                        [f"wall{args.group_id}_{event.obj.id}"],
+                    )
+        if event.type == VkBotEventType.MESSAGE_NEW:
+            if event.from_chat and event.obj.message['from_id'] == int(args.admin):
+                if str.startswith(event.obj.message['text'], SUBSCRIBE_COMMAND):
+                    text = None
+                    if str.startswith(event.obj.message['text'], SUBSCRIBE_COMMAND + " "):
+                        text = event.obj.message['text'][len(SUBSCRIBE_COMMAND) + 1 :]
+                        text = str.format(text, all="@all")
+                    try:
+                        with con:
+                            sql = "INSERT INTO subscriptions(group_id,chat_id) VALUES(?,?);"
+                            entry = (int(args.group_id), int(event.chat_id))
+                            if text is not None and text:
+                                sql = "INSERT INTO subscriptions(group_id,chat_id,msg_text) VALUES(?,?,?);"
+                                entry = (int(args.group_id), int(event.chat_id), text)
+                            con.execute(sql, entry)
+                    except Exception:
+                        print(Exception)
+                        send_message(
+                            vk,
+                            chat_id=int(event.chat_id),
+                            message="not okay, check console",
+                        )
 
-
-def wall_attachment(post: dict) -> str:
-    return "{type}{owner_id}_{media_id}".format(
-        type="wall",
-        owner_id=post['owner_id'],
-        media_id=post['id'])
-
-
-def check_chat(chat_id: int, vk: VkApiMethod) -> ChatStatus:
-    while True:
-        try:
-            vk.messages.getConversationsById(peer_ids=chat_id)
-        except vk_api.ApiError as e:
-            if e.code == 6:
-                time.sleep(10)
-                continue
-            if e.code == 927:
-                return ChatStatus.not_found
-            elif e.code == 917:
-                return ChatStatus.cant_write
+                    else:
+                        send_message(vk, chat_id=int(event.chat_id), message="okay")
+                    continue
+                if str.startswith(event.obj.message['text'], UNSUBSCRIBE_COMMAND):
+                    try:
+                        with con:
+                            sql = "DELETE FROM subscriptions WHERE group_id = ? AND chat_id = ?;"
+                            entry = (int(args.group_id), int(event.chat_id))
+                            con.execute(sql, entry)
+                    except Exception:
+                        print(Exception)
+                        send_message(
+                            vk,
+                            chat_id=int(event.chat_id),
+                            message="not okay, check console",
+                        )
+                    else:
+                        send_message(vk, chat_id=int(event.chat_id), message="okay")
+                    continue
         else:
-            return ChatStatus.available
-
-
-def process_chat(chat_id: int, posts: list, vk: VkApiMethod) -> None:
-    """Reposts posts to chat"""
-    for post in posts:
-        try:
-            vk.messages.send(
-                random_id=vk_api.utils.get_random_id(),
-                peer_id=chat_id,
-                message=os.environ['MESSAGE'] or "Новый пост!",
-                attachment=wall_attachment(post))
-        except vk_api.ApiError as e:
-            if e.code == 917:
-                break
-            if e.code == 6:
-                time.sleep(6)
-                e.try_method()
-
-
-def main():
-    service_session = vk_api.VkApi(token=os.environ['SERVICE_TOKEN'])
-    community_session = vk_api.VkApi(token=os.environ['ACCESS_TOKEN'])
-    service = service_session.get_api()
-    community = community_session.get_api()
-
-    wall = service.wall.get(owner_id=os.environ['WALL_ID'], count=10)
-    wall = wall['items']
-    wall = sorted(wall, key=lambda item: item['id'])
-
-    last_post_id = get_last_post_id()
-    if last_post_id is None:
-        wall = [wall[-1]]
-    else:
-        wall = list(filter(lambda post: post['id'] > last_post_id, wall))
-
-    if len(wall) == 0:
-        return
-
-    i = 2000000000
-    while True:
-        i += 1
-        status = check_chat(i, community)
-        if status == ChatStatus.available:
-            process_chat(i, wall, community)
-        if status == ChatStatus.cant_write:
-            continue
-        if status == ChatStatus.not_found:
-            break
-
-    set_last_post_id(wall[-1]['id'])
+            print(f"Unhandled event ({str(event.type)})")
 
 
 if __name__ == "__main__":
-    load_dotenv()
-    main()
+    parser = argparse.ArgumentParser(
+        prog="VKBotWallNotifier",
+        description="This bot notifies about new posts in chats",
+        epilog="Consider supporting me! https://github.com/nukdokplex",
+    )
+
+    parser.add_argument(
+        "group_id",
+        help="Identifier of your group",
+    )
+    parser.add_argument("token", help="Bot token")
+
+    parser.add_argument(
+        "admin",
+        help='Bot admin id (has permission to "!subscribe" and "!unsubscribe" commands)',
+    )
+    parser.add_argument(
+        "-d", "--database", help="Path to database file", default="subscriptions.db"
+    )
+
+    args = parser.parse_args()
+    main(args)
