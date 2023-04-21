@@ -138,5 +138,7 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-last_post_id.json
+subscriptions.db
 .idea
+.vscode/
+
