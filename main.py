@@ -1,127 +1,103 @@
 import argparse
-import vk_api
-import random
-from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
-from vk_api.execute import VkApiMethod
+import logging
 import sqlite3
+from typing import Optional
+import random
 
-SUBSCRIBE_COMMAND = "!subscribe"
-UNSUBSCRIBE_COMMAND = "!unsubscribe"
+from vkbottle import GroupEventType, GroupTypes, VKAPIError
+from vkbottle.bot import Bot, Message
+from vkbottle.modules import logger
 
-
-def send_message(
-    vk: VkApiMethod, chat_id: int, message: str, attachments: list[str] = None
-):
-    args = {
-        "chat_id": chat_id,
-        "message": message,
-        "random_id": random.randint(-2_147_483_648, 2_147_483_647),
-    }
-    if attachments is not None:
-        args["attachment"] = ",".join(attachments)
-    vk.messages.send(**args)
+from rules import RuleIsAdmin
 
 
-def main(args: argparse.Namespace):
-    """The main method which runs cycle"""
-    print("Creating session...")
+parser = argparse.ArgumentParser(
+    prog="VKBotWallNotifier",
+    description="This bot notifies about new posts in chats",
+    epilog="Consider supporting me! https://github.com/nukdokplex",
+)
+parser.add_argument("token", help="Bot token")
+parser.add_argument(
+    "admin",
+    help='Bot admin id (has permission to "/subscribe" and "/unsubscribe" commands)',
+)
+parser.add_argument(
+    "-d", "--database", help="Path to database file", default="subscriptions.db"
+)
+args = parser.parse_args()
+bot = Bot(args.token)
+logging.basicConfig(level=logging.INFO)
+logging.info("Initializing database...")
+con = sqlite3.connect(args.database)
+with con:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS subscriptions("
+        "id INTEGER PRIMARY KEY, "
+        "group_id UNSIGNED BIG INT NOT NULL, "
+        "chat_id UNSIGNED BIG INT NOT NULL, "
+        "msg_text TEXT, "
+        "UNIQUE(group_id, chat_id) ON CONFLICT REPLACE);"
+    )
+bot.labeler.custom_rules["only_admin"] = RuleIsAdmin
 
-    session = vk_api.VkApi(token=args.token)
-    longpoll = VkBotLongPoll(session, abs(int(args.group_id)))
-    vk = session.get_api()
 
-    print("Connecting database...")
-    con = sqlite3.connect(args.database)
-    with con:
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS subscriptions("
-            "id INTEGER PRIMARY KEY, "
-            "group_id UNSIGNED BIG INT NOT NULL, "
-            "chat_id UNSIGNED BIG INT NOT NULL, "
-            "msg_text TEXT, "
-            "UNIQUE(group_id, chat_id) ON CONFLICT REPLACE);"
-        )
+@bot.on.chat_message(
+    text=["/subscribe <text>", "/subscribe"], only_admin=int(args.admin)
+)
+async def subscribe_cmd(message: Message, text: Optional[str] = None):
+    logging.info(f'"subscribe" command invoked by {str(message.peer_id)}.')
+    if text is not None:
+        text = text.format(all="@all", everyone="@everyone", online="@online", here="@here")
+    try:
+        with con:
+            sql = "INSERT INTO subscriptions(group_id,chat_id,msg_text) VALUES(?,?,?);"
+            entry = (message.group_id, message.chat_id, text)
+            con.execute(sql, entry)
+    except Exception as e:
+        logger.error(e)
+        await message.answer("not okay, check console")
+    else:
+        await message.answer("okay")
 
-    print("Bot started! Listening to longpoll events...")
 
-    for event in longpoll.listen():
-        if event.type == VkBotEventType.WALL_POST_NEW:
-            print("New post event! Sending to subscribed chats...")
-            with con:
-                sql = "SELECT * FROM subscriptions WHERE group_id = ?;"
-                for subscription in con.execute(sql, (int(args.group_id),)):
-                    send_message(
-                        vk,
-                        subscription[2],
-                        subscription[3] or "",
-                        [f"wall{args.group_id}_{event.obj.id}"],
+@bot.on.chat_message(text=["/unsubscribe"], only_admin=int(args.admin))
+async def unsubscribe_cmd(message: Message):
+    logging.info(
+        f'"unsubscribe" command invoked by {message.from_id} in {message.peer_id}.'
+    )
+
+    try:
+        with con:
+            sql = "DELETE FROM subscriptions WHERE group_id = ? AND chat_id = ?;"
+            entry = (message.group_id, message.chat_id)
+            con.execute(sql, entry)
+    except Exception as e:
+        logging.error(e)
+        await message.answer("not okay, check console")
+    else:
+        await message.answer("okay")
+
+
+@bot.on.raw_event(GroupEventType.WALL_POST_NEW, GroupTypes.WallPostNew)
+async def wall_post_new_handler(event: GroupTypes.WallPostNew):
+    logging.info("New post event, performing notifications.")
+    try:
+        sql = "SELECT * FROM subscriptions WHERE group_id = ?;"
+        with con:
+            for subscription in con.execute(sql, (bot.polling.group_id,)):
+                try:
+                    await bot.api.messages.send(
+                        random_id=random.randint(-2_147_483_638, 2_147_483_637),
+                        chat_id=subscription[2],
+                        message=subscription[3] or "",
+                        attachment=f"wall{-bot.polling.group_id}_{event.object.id}",
                     )
-        if event.type == VkBotEventType.MESSAGE_NEW:
-            if event.from_chat and event.obj.message['from_id'] == int(args.admin):
-                if str.startswith(event.obj.message['text'], SUBSCRIBE_COMMAND):
-                    text = None
-                    if str.startswith(event.obj.message['text'], SUBSCRIBE_COMMAND + " "):
-                        text = event.obj.message['text'][len(SUBSCRIBE_COMMAND) + 1 :]
-                        text = str.format(text, all="@all")
-                    try:
-                        with con:
-                            sql = "INSERT INTO subscriptions(group_id,chat_id) VALUES(?,?);"
-                            entry = (int(args.group_id), int(event.chat_id))
-                            if text is not None and text:
-                                sql = "INSERT INTO subscriptions(group_id,chat_id,msg_text) VALUES(?,?,?);"
-                                entry = (int(args.group_id), int(event.chat_id), text)
-                            con.execute(sql, entry)
-                    except Exception:
-                        print(Exception)
-                        send_message(
-                            vk,
-                            chat_id=int(event.chat_id),
-                            message="not okay, check console",
-                        )
-
-                    else:
-                        send_message(vk, chat_id=int(event.chat_id), message="okay")
-                    continue
-                if str.startswith(event.obj.message['text'], UNSUBSCRIBE_COMMAND):
-                    try:
-                        with con:
-                            sql = "DELETE FROM subscriptions WHERE group_id = ? AND chat_id = ?;"
-                            entry = (int(args.group_id), int(event.chat_id))
-                            con.execute(sql, entry)
-                    except Exception:
-                        print(Exception)
-                        send_message(
-                            vk,
-                            chat_id=int(event.chat_id),
-                            message="not okay, check console",
-                        )
-                    else:
-                        send_message(vk, chat_id=int(event.chat_id), message="okay")
-                    continue
-        else:
-            print(f"Unhandled event ({str(event.type)})")
+                except Exception as e:
+                    logger.error(e)
+                    logger.error(f"Can't send to {subscription[2]} chat.")
+    except Exception as e:
+        logger.error(e)
+        logger.error("Common error while distribution.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="VKBotWallNotifier",
-        description="This bot notifies about new posts in chats",
-        epilog="Consider supporting me! https://github.com/nukdokplex",
-    )
-
-    parser.add_argument(
-        "group_id",
-        help="Identifier of your group",
-    )
-    parser.add_argument("token", help="Bot token")
-
-    parser.add_argument(
-        "admin",
-        help='Bot admin id (has permission to "!subscribe" and "!unsubscribe" commands)',
-    )
-    parser.add_argument(
-        "-d", "--database", help="Path to database file", default="subscriptions.db"
-    )
-
-    args = parser.parse_args()
-    main(args)
+bot.run_forever()
